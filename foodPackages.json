@@ -1,0 +1,31 @@
+[
+    {
+        "name": "Standard Lunch",
+        "price": 180,
+        "items": [
+            { "name": "Morog Polau", "quantity": 1 },
+            { "name": "Sonali Murgi", "quantity": 1 },
+            { "name": "Vegetable", "quantity": 1 },
+            { "name": "Water Bottle", "quantity": 1 }
+        ]
+    },
+    {
+        "name": "Premium Dinner",
+        "price": 250,
+        "items": [
+            { "name": "Khichuri", "quantity": 1 },
+            { "name": "Hash Bhuna", "quantity": 1 },
+            { "name": "Egg Curry", "quantity": 1 },
+            { "name": "Soft Drink", "quantity": 1 }
+        ]
+    },
+    {
+        "name": "Snacks & Tea",
+        "price": 50,
+        "items": [
+            { "name": "Singara", "quantity": 2 },
+            { "name": "Chola", "quantity": 1 },
+            { "name": "Masala Tea", "quantity": 1 }
+        ]
+    }
+]
