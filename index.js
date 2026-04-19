@@ -1145,6 +1145,9 @@ app.post('/foods', async (req, res) => {
       return res.status(400).json({ message: 'Missing required fields: name, price, category' });
     }
 
+    const providedStock = Number(food.stock ?? food.quantity ?? 0);
+    food.stock = Number.isNaN(providedStock) ? 0 : providedStock;
+
     // Initialize availability
     food.availability = {};
     if (Array.isArray(food.category)) {
@@ -1173,7 +1176,8 @@ app.put('/foods/:id', async (req, res) => {
     }
 
     // Ensure essential fields are not stripped out if not provided
-    const { name, price, unit, image, rating, category, available } = foodUpdate;
+    const { name, price, unit, image, rating, category, available, stock, quantity } = foodUpdate;
+    const resolvedStockValue = stock !== undefined ? Number(stock) : (quantity !== undefined ? Number(quantity) : undefined);
     const updatedFood = {
       ...(name && { name }),
       ...(price && { price }),
@@ -1182,6 +1186,7 @@ app.put('/foods/:id', async (req, res) => {
       ...(rating && { rating }),
       ...(category && { category }),
       ...(available !== undefined && { available }),
+      ...(resolvedStockValue !== undefined && !Number.isNaN(resolvedStockValue) && { stock: resolvedStockValue }),
       updatedAt: new Date()
     };
 
@@ -1210,6 +1215,42 @@ app.put('/foods/:id', async (req, res) => {
   }
 });
 
+app.patch('/foods/:id/stock', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+    const { id } = req.params;
+    const stockValue = Number(req.body?.stock);
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: 'Invalid ID format' });
+    }
+
+    if (Number.isNaN(stockValue) || stockValue < 0) {
+      return res.status(400).json({ message: 'Stock must be a non-negative number' });
+    }
+
+    const result = await db.collection('FoodItems').updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          stock: stockValue,
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: 'Food item not found' });
+    }
+
+    res.status(200).json({ message: 'Food stock updated successfully' });
+  } catch (error) {
+    console.error('Error updating food stock:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 app.delete('/foods/:id', async (req, res) => {
   try {
     const client = await connectToDatabase();
@@ -1229,6 +1270,138 @@ app.delete('/foods/:id', async (req, res) => {
     res.status(200).json({ message: 'Food item deleted successfully' });
   } catch (error) {
     console.error('Error deleting food item:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.get('/raw-materials', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+
+    const materials = await db
+      .collection('RawMaterials')
+      .find()
+      .sort({ updatedAt: -1, createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(materials);
+  } catch (error) {
+    console.error('Error fetching raw materials:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.post('/raw-materials', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+
+    const {
+      name,
+      unit,
+      supplier = '',
+      currentStock,
+      minStock
+    } = req.body;
+
+    const parsedCurrentStock = Number(currentStock);
+    const parsedMinStock = Number(minStock);
+
+    if (!name || !unit || Number.isNaN(parsedCurrentStock) || Number.isNaN(parsedMinStock)) {
+      return res.status(400).json({ message: 'name, unit, currentStock and minStock are required' });
+    }
+
+    if (parsedCurrentStock < 0 || parsedMinStock < 0) {
+      return res.status(400).json({ message: 'Stock values must be non-negative' });
+    }
+
+    const material = {
+      name,
+      unit,
+      supplier,
+      currentStock: parsedCurrentStock,
+      minStock: parsedMinStock,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await db.collection('RawMaterials').insertOne(material);
+    res.status(201).json({ message: 'Raw material created successfully', insertedId: result.insertedId });
+  } catch (error) {
+    console.error('Error creating raw material:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.put('/raw-materials/:id', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: 'Invalid ID format' });
+    }
+
+    const { name, unit, supplier, currentStock, minStock } = req.body;
+    const updateDoc = {
+      ...(name !== undefined && { name }),
+      ...(unit !== undefined && { unit }),
+      ...(supplier !== undefined && { supplier }),
+      ...(currentStock !== undefined && !Number.isNaN(Number(currentStock)) && { currentStock: Number(currentStock) }),
+      ...(minStock !== undefined && !Number.isNaN(Number(minStock)) && { minStock: Number(minStock) }),
+      updatedAt: new Date(),
+    };
+
+    const result = await db.collection('RawMaterials').updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateDoc }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: 'Raw material not found' });
+    }
+
+    res.status(200).json({ message: 'Raw material updated successfully' });
+  } catch (error) {
+    console.error('Error updating raw material:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.patch('/raw-materials/:id/stock', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+    const { id } = req.params;
+    const parsedStock = Number(req.body?.currentStock);
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: 'Invalid ID format' });
+    }
+
+    if (Number.isNaN(parsedStock) || parsedStock < 0) {
+      return res.status(400).json({ message: 'currentStock must be a non-negative number' });
+    }
+
+    const result = await db.collection('RawMaterials').updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          currentStock: parsedStock,
+          updatedAt: new Date(),
+        }
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: 'Raw material not found' });
+    }
+
+    res.status(200).json({ message: 'Raw material stock updated successfully' });
+  } catch (error) {
+    console.error('Error updating raw material stock:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
