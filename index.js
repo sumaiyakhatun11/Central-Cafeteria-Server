@@ -83,7 +83,8 @@ app.post('/adminlogin', async (req, res) => {
         _id: admin._id,
         email: admin.email,
         isadmin: true,
-        isSuperAdmin: admin.isSuperAdmin || false
+        isSuperAdmin: admin.isSuperAdmin || false,
+        role: 'admin' // Added role for client-side authentication context
       }
     });
 
@@ -129,7 +130,8 @@ app.post('/login', async (req, res) => {
     }
 
     // Destructure and prepare response data
-    const { _id, email, id, role, name, privileged } = user;
+    const { _id, email, id, role, name, privileged, isadmin, isSuperAdmin } = user;
+    const resolvedRole = role || (isadmin || isSuperAdmin ? 'admin' : 'user');
 
     res.status(200).json({
       message: 'Login successful',
@@ -138,7 +140,7 @@ app.post('/login', async (req, res) => {
         name: name || '',
         email,
         userId: id,
-        role: role || 'user',
+        role: resolvedRole,
         privileged: privileged || false
       }
     });
@@ -1087,6 +1089,29 @@ app.get('/api/events/analytics-range', async (req, res) => {
   }
 });
 
+// Add this new endpoint
+app.get('/users/:userId/events', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+    const eventsCollection = db.collection('Events');
+
+    const { userId } = req.params;
+
+    if (!userId) { // Using userId as string, not ObjectId for this query
+      return res.status(400).json({ message: 'User ID is required' });
+    }
+
+    const events = await eventsCollection.find({ id: userId }).sort({ eventDate: -1 }).toArray();
+
+    res.status(200).json({ events });
+
+  } catch (error) {
+    console.error('Error fetching user events:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 
 
 app.get('/foods', async (req, res) => {
@@ -1531,6 +1556,23 @@ app.patch('/order/:id/status', async (req, res) => {
       return res.status(400).json({ message: 'Invalid status value' });
     }
 
+    const order = await db.collection('OrdersQueue').findOne({ _id: new ObjectId(id) });
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    // If order is cancelled and was paid with coins, refund the coins
+    if (status === 'cancelled' && order.paidWithCoins) {
+      const settings = await db.collection('Settings').findOne({ _id: 'coinSettings' });
+      const coinValue = settings && settings.value ? settings.value : 5; // Default to 5 if not set
+      const coinRefundAmount = order.totalPrice / coinValue;
+
+      await db.collection('Users').updateOne(
+        { _id: new ObjectId(order.userId) },
+        { $inc: { coins: coinRefundAmount } }
+      );
+    }
+
     const result = await db.collection('OrdersQueue').updateOne(
       { _id: new ObjectId(id) },
       { $set: { status } }
@@ -1962,6 +2004,37 @@ app.get('/food-packages', async (req, res) => {
     res.status(200).json(packages);
   } catch (error) {
     console.error('Error fetching food packages:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.patch('/users/:userId/refund-coins', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+    const { userId } = req.params;
+    const { amount } = req.body;
+
+    if (!ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: 'Invalid user ID format' });
+    }
+
+    if (amount === undefined || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+      return res.status(400).json({ message: 'Invalid amount provided' });
+    }
+
+    const result = await db.collection('Users').updateOne(
+      { _id: new ObjectId(userId) },
+      { $inc: { coins: parseFloat(amount) } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    res.status(200).json({ message: `Successfully refunded ${amount} coins to user ${userId}` });
+  } catch (error) {
+    console.error('Error refunding coins:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
