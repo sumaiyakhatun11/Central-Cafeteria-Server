@@ -1001,6 +1001,39 @@ app.patch('/events/:id/payment-status', async (req, res) => {
   }
 });
 
+// Admin: Cancel an event booking
+app.patch('/events/:id/cancel', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+    const eventsCollection = db.collection('Events');
+
+    const eventId = req.params.id;
+    if (!ObjectId.isValid(eventId)) {
+      return res.status(400).json({ message: 'Invalid event ID format.' });
+    }
+
+    const update = {
+      $set: {
+        status: 'cancelled',
+        cancelledBy: 'admin',
+        cancelledAt: new Date(),
+        cancelReason: req.body.reason || 'Cancelled by admin'
+      }
+    };
+
+    const result = await eventsCollection.updateOne({ _id: new ObjectId(eventId) }, update);
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: 'Event not found.' });
+    }
+
+    res.status(200).json({ message: `Event ${eventId} cancelled successfully.` });
+  } catch (error) {
+    console.error('Error cancelling event:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 app.get('/api/events/range', async (req, res) => {
 
   try {
@@ -1941,14 +1974,25 @@ app.post('/order/queue', async (req, res) => {
       );
     }
 
-    // Insert into queue orders collection
-    const insertResult = await queueCollection.insertOne(order);
 
-    const refreshedQueue = await refreshQueuePositions(db);
-    const placedOrder = refreshedQueue.find((entry) => String(entry._id) === String(insertResult.insertedId));
-    const finalQueuePosition = placedOrder?.queue_position || initialQueuePosition;
+    // If teacher, do NOT insert into the main queue; store as immediate order instead
+    let insertResult;
+    let finalQueuePosition = initialQueuePosition;
+    if (isTeacher) {
+      const immediateCollection = db.collection('ImmediateOrders');
+      insertResult = await immediateCollection.insertOne(order);
+      finalQueuePosition = 0;
+      // Do not broadcast queue update for teacher immediate orders
+    } else {
+      // Insert into queue orders collection
+      insertResult = await queueCollection.insertOne(order);
 
-    await broadcastQueueUpdate(db);
+      const refreshedQueue = await refreshQueuePositions(db);
+      const placedOrder = refreshedQueue.find((entry) => String(entry._id) === String(insertResult.insertedId));
+      finalQueuePosition = placedOrder?.queue_position || initialQueuePosition;
+
+      await broadcastQueueUpdate(db);
+    }
 
     // Clear user cart after placing order
     await db.collection('Users').updateOne(
