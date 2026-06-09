@@ -1,10 +1,15 @@
+const dns = require('dns');
+dns.setServers(['8.8.8.8', '8.8.4.4']);
+const path = require('path');
+const fs = require('fs');
+
 const express = require('express');
 const app = express();
 const cors = require('cors');
 const port = process.env.PORT || 5000;
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const bcrypt = require('bcryptjs');
-require('dotenv').config();
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 app.use(cors());
 app.use(express.json());
@@ -14,6 +19,10 @@ const uri = process.env.MONGODB_URI;
 let cachedClient = null;
 
 async function connectToDatabase() {
+  if (!uri) {
+    throw new Error('MONGODB_URI is missing. Ensure CentralCafetariaServer/.env is present and valid.');
+  }
+
   if (cachedClient && cachedClient.topology && cachedClient.topology.isConnected()) {
     return cachedClient;
   }
@@ -207,12 +216,7 @@ app.post('/register', async (req, res) => {
     const client = await connectToDatabase();
     const db = client.db('CentralCafetaria');
 
-    const { name, registrationNumber, email, id, password, qrCodeString, idCardFrontUrl, idCardBackUrl } = req.body;
-
-    // Validate required fields
-    if (!name || !registrationNumber || !email || !id || !password) {
-      return res.status(400).json({ message: 'All fields are required' });
-    }
+    const { name, registrationNumber, email, id, password, qrCodeString, idCardFrontUrl, idCardBackUrl, role } = req.body;
 
     // Validate email format
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -223,6 +227,20 @@ app.post('/register', async (req, res) => {
     // Validate password length
     if (password.length < 6) {
       return res.status(400).json({ message: 'Password must be at least 6 characters' });
+    }
+
+    const normalizedRole = typeof role === 'string' ? role.toLowerCase().trim() : 'teacher';
+    const allowedRoles = ['student', 'teacher'];
+    if (!allowedRoles.includes(normalizedRole)) {
+      return res.status(400).json({ message: 'Invalid role selected' });
+    }
+
+    if (!name || !email || !id || !password) {
+      return res.status(400).json({ message: 'Name, email, ID and password are required' });
+    }
+
+    if (normalizedRole === 'student' && !registrationNumber) {
+      return res.status(400).json({ message: 'Registration number is required for students' });
     }
 
     // Check for existing email, ID, or QR code string
@@ -248,9 +266,10 @@ app.post('/register', async (req, res) => {
     // Build user document
     const userDoc = {
       name,
-      registrationNumber,
+      registrationNumber: normalizedRole === 'student' ? registrationNumber : '',
       email,
       id,
+      role: normalizedRole,
       password: hashedPassword,
       qrCodeString,
       idCardFrontUrl,
@@ -1611,24 +1630,225 @@ app.delete('/cart/:userId', async (req, res) => {
 
 
 
+const ORDER_STATUS = Object.freeze({
+  PLACED: 'Placed',
+  READY: 'Ready',
+  COMPLETED: 'Completed',
+  CANCELLED: 'Cancelled'
+});
+
+const queueStreamClients = new Set();
+const QUEUE_ORDERS_COLLECTION = 'QueueOrders';
+const QUEUE_CONTROL_COLLECTION = 'QueueControl';
+const QUEUE_CONTROL_DOC_ID = 'main';
+const DEFAULT_QUEUE_CONTROL = {
+  _id: QUEUE_CONTROL_DOC_ID,
+  minutesPerOrder: 2,
+  queueEnabled: true
+};
+
+const normalizeOrderStatus = (status) => {
+  const normalized = String(status || '').toLowerCase();
+
+  if (normalized === 'placed') return ORDER_STATUS.PLACED;
+  if (normalized === 'ready') return ORDER_STATUS.READY;
+  if (normalized === 'completed') return ORDER_STATUS.COMPLETED;
+  if (normalized === 'cancelled') return ORDER_STATUS.CANCELLED;
+
+  return ORDER_STATUS.PLACED;
+};
+
+const getQueueOrdersCollection = (db) => db.collection(QUEUE_ORDERS_COLLECTION);
+
 const generateUniqueQueueId = async (db) => {
   let queueId;
   let exists = true;
+  const queueCollection = getQueueOrdersCollection(db);
 
   while (exists) {
-    queueId = Math.floor(1000 + Math.random() * 9000); // 4-digit number
-    const existing = await db.collection('OrdersQueue').findOne({ queueId });
+    queueId = Math.floor(1000 + Math.random() * 9000);
+    const existing = await queueCollection.findOne({ queueId });
     exists = !!existing;
   }
 
   return queueId;
 };
 
+const generateUniqueToken = async (db) => {
+  const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const prefix = `TK-${datePart}-`;
+  let attempts = 0;
+  const queueCollection = getQueueOrdersCollection(db);
+
+  while (attempts < 2000) {
+    const suffix = Math.floor(100 + Math.random() * 900);
+    const token = `${prefix}${suffix}`;
+    const existing = await queueCollection.findOne({ token });
+    if (!existing) {
+      return token;
+    }
+    attempts += 1;
+  }
+
+  throw new Error('Failed to generate a unique token');
+};
+
+const calculateEstimatedWaitingMinutes = (queuePosition, minutesPerOrder = 2) => Math.max(queuePosition, 0) * Math.max(Number(minutesPerOrder) || 2, 1);
+
+const ensureQueueControl = async (db) => {
+  const collection = db.collection(QUEUE_CONTROL_COLLECTION);
+
+  await collection.updateOne(
+    { _id: QUEUE_CONTROL_DOC_ID },
+    {
+      $setOnInsert: {
+        ...DEFAULT_QUEUE_CONTROL,
+        createdAt: new Date()
+      },
+      $set: { updatedAt: new Date() }
+    },
+    { upsert: true }
+  );
+
+  const doc = await collection.findOne({ _id: QUEUE_CONTROL_DOC_ID });
+  return {
+    ...DEFAULT_QUEUE_CONTROL,
+    ...(doc || {})
+  };
+};
+
+const getQueueStatsSnapshot = async (db) => {
+  const queueCollection = getQueueOrdersCollection(db);
+
+  const dayStart = new Date();
+  dayStart.setHours(0, 0, 0, 0);
+  const nextDay = new Date(dayStart);
+  nextDay.setDate(nextDay.getDate() + 1);
+
+  const [
+    totalOrdersToday,
+    pendingOrders,
+    readyOrders,
+    completedOrders
+  ] = await Promise.all([
+    queueCollection.countDocuments({
+      $or: [
+        { created_at: { $gte: dayStart, $lt: nextDay } },
+        { placedAt: { $gte: dayStart, $lt: nextDay } }
+      ]
+    }),
+    queueCollection.countDocuments({ status: ORDER_STATUS.PLACED }),
+    queueCollection.countDocuments({ status: ORDER_STATUS.READY }),
+    queueCollection.countDocuments({ status: ORDER_STATUS.COMPLETED })
+  ]);
+
+  return {
+    totalOrdersToday,
+    pendingOrders,
+    readyOrders,
+    completedOrders
+  };
+};
+
+const getCompletedOrdersSnapshot = async (db, limit = 100) => {
+  const queueCollection = getQueueOrdersCollection(db);
+
+  return queueCollection
+    .find({ status: ORDER_STATUS.COMPLETED })
+    .sort({ completed_at: -1, placedAt: -1 })
+    .limit(limit)
+    .toArray();
+};
+
+const getActiveQueueSnapshot = async (db) => {
+  const refreshedQueue = await refreshQueuePositions(db);
+
+  return refreshedQueue
+    .map((order) => ({
+      ...order,
+      userId: String(order.userId)
+    }))
+    .sort((a, b) => a.queue_position - b.queue_position);
+};
+
+const broadcastQueueUpdate = async (db) => {
+  if (queueStreamClients.size === 0) {
+    return;
+  }
+
+  const [activeQueue, completedOrders, stats] = await Promise.all([
+    getActiveQueueSnapshot(db),
+    getCompletedOrdersSnapshot(db),
+    getQueueStatsSnapshot(db)
+  ]);
+
+  const payload = JSON.stringify({
+    activeQueue,
+    completedOrders: completedOrders.map((order) => ({
+      ...order,
+      status: ORDER_STATUS.COMPLETED
+    })),
+    stats,
+    updatedAt: new Date().toISOString()
+  });
+
+  for (const client of queueStreamClients) {
+    client.write(`event: queue_update\n`);
+    client.write(`data: ${payload}\n\n`);
+  }
+};
+
+const refreshQueuePositions = async (db) => {
+  const queueCollection = getQueueOrdersCollection(db);
+  const queueControl = await ensureQueueControl(db);
+  const minutesPerOrder = queueControl.minutesPerOrder || 2;
+
+  const activeOrders = await queueCollection
+    .find({
+      status: {
+        $in: [ORDER_STATUS.PLACED, ORDER_STATUS.READY]
+      }
+    })
+    .sort({ created_at: 1, placedAt: 1, _id: 1 })
+    .toArray();
+
+  if (activeOrders.length === 0) {
+    return [];
+  }
+
+  const bulkOps = activeOrders.map((order, index) => {
+    const normalizedStatus = normalizeOrderStatus(order.status);
+    const queuePosition = index + 1;
+
+    return {
+      updateOne: {
+        filter: { _id: order._id },
+        update: {
+          $set: {
+            status: normalizedStatus,
+            queue_position: queuePosition,
+            estimated_waiting_minutes: calculateEstimatedWaitingMinutes(queuePosition, minutesPerOrder)
+          }
+        }
+      }
+    };
+  });
+
+  await queueCollection.bulkWrite(bulkOps);
+
+  return activeOrders.map((order, index) => ({
+    ...order,
+    status: normalizeOrderStatus(order.status),
+    queue_position: index + 1,
+    estimated_waiting_minutes: calculateEstimatedWaitingMinutes(index + 1, minutesPerOrder)
+  }));
+};
+
 app.post('/order/queue', async (req, res) => {
   try {
     const client = await connectToDatabase();
     const db = client.db('CentralCafetaria');
-    const { userId, usePrivilege = false, payWithCoins = false } = req.body;
+      const { userId, usePrivilege = false, payWithCoins = false, tableNumber = null } = req.body;
 
     if (!userId) {
       return res.status(400).json({ message: 'User ID is required' });
@@ -1637,7 +1857,7 @@ app.post('/order/queue', async (req, res) => {
     // Find user and their cart
     const user = await db.collection('Users').findOne(
       { _id: new ObjectId(userId) },
-      { projection: { cart: 1, privileged: 1, coins: 1 } }
+      { projection: { cart: 1, privileged: 1, coins: 1, name: 1, id: 1, role: 1 } }
     );
 
     if (!user || !user.cart || user.cart.length === 0) {
@@ -1664,20 +1884,45 @@ app.post('/order/queue', async (req, res) => {
       return res.status(403).json({ message: 'Unauthorized privilege usage attempt' });
     }
 
-    // Generate unique 4-digit queue ID
+    // Generate queue ID + token
     const queueId = await generateUniqueQueueId(db);
+    const token = await generateUniqueToken(db);
 
     const totalPrice = usePrivilege
       ? 0
       : user.cart.reduce((acc, item) => acc + (item.unit * Number(item.price)), 0);
 
+    const now = new Date();
+    const queueCollection = getQueueOrdersCollection(db);
+    const queueControl = await ensureQueueControl(db);
+    const minutesPerOrder = queueControl.minutesPerOrder || 2;
+
+    const activeCount = await queueCollection.countDocuments({
+      status: {
+        $in: [ORDER_STATUS.PLACED, ORDER_STATUS.READY]
+      }
+    });
+
+    const initialQueuePosition = activeCount + 1;
+
+    const isTeacher = user && (user.role === 'teacher' || user.role === 'Teacher');
+
     const order = {
+      token,
       queueId,
       userId: new ObjectId(userId),
+      customer_name: user.name || user.id || 'Customer',
+      items: user.cart,
       orderDetails: user.cart,
-      placedAt: new Date(),
-      status: 'pending',
+      created_at: now,
+      placedAt: now,
+      // If teacher, mark ready (no waiting)
+      status: isTeacher ? ORDER_STATUS.READY : ORDER_STATUS.PLACED,
+      queue_position: isTeacher ? 0 : initialQueuePosition,
+      estimated_waiting_minutes: isTeacher ? 0 : calculateEstimatedWaitingMinutes(initialQueuePosition, minutesPerOrder),
+      completed_at: null,
       totalPrice,
+      tableNumber: tableNumber || null,
       ...(usePrivilege && { privilegeUsed: true }),
       ...(payWithCoins && { paidWithCoins: true })
     };
@@ -1696,8 +1941,14 @@ app.post('/order/queue', async (req, res) => {
       );
     }
 
-    // Insert into OrdersQueue
-    await db.collection('OrdersQueue').insertOne(order);
+    // Insert into queue orders collection
+    const insertResult = await queueCollection.insertOne(order);
+
+    const refreshedQueue = await refreshQueuePositions(db);
+    const placedOrder = refreshedQueue.find((entry) => String(entry._id) === String(insertResult.insertedId));
+    const finalQueuePosition = placedOrder?.queue_position || initialQueuePosition;
+
+    await broadcastQueueUpdate(db);
 
     // Clear user cart after placing order
     await db.collection('Users').updateOne(
@@ -1707,8 +1958,17 @@ app.post('/order/queue', async (req, res) => {
 
     res.status(201).json({
       message: 'Order placed successfully',
+      token,
       queueId,
-      order
+      queuePosition: isTeacher ? 0 : finalQueuePosition,
+      status: isTeacher ? ORDER_STATUS.READY : ORDER_STATUS.PLACED,
+      estimatedWaitingMinutes: isTeacher ? 0 : calculateEstimatedWaitingMinutes(finalQueuePosition, minutesPerOrder),
+      order: {
+        ...order,
+        _id: insertResult.insertedId,
+        queue_position: isTeacher ? 0 : finalQueuePosition,
+        estimated_waiting_minutes: isTeacher ? 0 : calculateEstimatedWaitingMinutes(finalQueuePosition, minutesPerOrder)
+      }
     });
 
   } catch (error) {
@@ -1725,20 +1985,36 @@ app.patch('/order/:id/status', async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
 
-    if (!['served', 'cancelled'].includes(status)) {
-      return res.status(400).json({ message: 'Invalid status value' });
+    const nextStatus = normalizeOrderStatus(status);
+    if (![ORDER_STATUS.READY, ORDER_STATUS.COMPLETED, ORDER_STATUS.CANCELLED].includes(nextStatus)) {
+      return res.status(400).json({ message: 'Invalid status value. Use Ready, Completed or Cancelled.' });
     }
 
-    const order = await db.collection('OrdersQueue').findOne({ _id: new ObjectId(id) });
+    const queueCollection = getQueueOrdersCollection(db);
+    const order = await queueCollection.findOne({ _id: new ObjectId(id) });
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
     }
 
+    const currentStatus = normalizeOrderStatus(order.status);
+
+    if (currentStatus === ORDER_STATUS.COMPLETED || currentStatus === ORDER_STATUS.CANCELLED) {
+      return res.status(400).json({ message: `Order is already ${currentStatus}.` });
+    }
+
+    if (nextStatus === ORDER_STATUS.READY && currentStatus !== ORDER_STATUS.PLACED) {
+      return res.status(400).json({ message: 'Only placed orders can be moved to ready.' });
+    }
+
+    if (nextStatus === ORDER_STATUS.COMPLETED && ![ORDER_STATUS.PLACED, ORDER_STATUS.READY].includes(currentStatus)) {
+      return res.status(400).json({ message: 'Only placed or ready orders can be completed.' });
+    }
+
     // If order is cancelled and was paid with coins, refund the coins
-    if (status === 'cancelled' && order.paidWithCoins) {
+    if (nextStatus === ORDER_STATUS.CANCELLED && order.paidWithCoins) {
       const settings = await db.collection('Settings').findOne({ _id: 'coinSettings' });
-      const coinValue = settings && settings.value ? settings.value : 5; // Default to 5 if not set
-      const coinRefundAmount = order.totalPrice / coinValue;
+      const coinValue = settings && settings.value ? settings.value : 5;
+      const coinRefundAmount = (order.totalPrice || 0) / coinValue;
 
       await db.collection('Users').updateOne(
         { _id: new ObjectId(order.userId) },
@@ -1746,18 +2022,73 @@ app.patch('/order/:id/status', async (req, res) => {
       );
     }
 
-    const result = await db.collection('OrdersQueue').updateOne(
+    const updatePayload = {
+      status: nextStatus,
+      ...(nextStatus === ORDER_STATUS.COMPLETED || nextStatus === ORDER_STATUS.CANCELLED
+        ? { completed_at: new Date(), queue_position: null, estimated_waiting_minutes: 0 }
+        : {})
+    };
+
+    const result = await queueCollection.updateOne(
       { _id: new ObjectId(id) },
-      { $set: { status } }
+      { $set: updatePayload }
     );
 
     if (result.modifiedCount === 0) {
       return res.status(404).json({ message: 'Order not found or already updated' });
     }
 
-    res.status(200).json({ message: `Order marked as ${status}` });
+    await refreshQueuePositions(db);
+    await broadcastQueueUpdate(db);
+
+    res.status(200).json({ message: `Order marked as ${nextStatus}` });
   } catch (error) {
     console.error('Status update error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.patch('/order/:id/received', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+    const { id } = req.params;
+    const { userId } = req.body;
+
+    const queueCollection = getQueueOrdersCollection(db);
+    const order = await queueCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    if (userId && String(order.userId) !== String(userId)) {
+      return res.status(403).json({ message: 'You can only complete your own order.' });
+    }
+
+    const currentStatus = normalizeOrderStatus(order.status);
+    if (currentStatus !== ORDER_STATUS.READY) {
+      return res.status(400).json({ message: 'Order must be Ready before marking as received.' });
+    }
+
+    await queueCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          status: ORDER_STATUS.COMPLETED,
+          completed_at: new Date(),
+          queue_position: null,
+          estimated_waiting_minutes: 0
+        }
+      }
+    );
+
+    await refreshQueuePositions(db);
+    await broadcastQueueUpdate(db);
+
+    res.status(200).json({ message: 'Order marked as Completed.' });
+  } catch (error) {
+    console.error('Received confirmation error:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
@@ -1768,16 +2099,23 @@ app.get('/queue', async (req, res) => {
   try {
     const client = await connectToDatabase();
     const db = client.db('CentralCafetaria');
-    const queueCollection = db.collection('OrdersQueue');
+    const queueCollection = getQueueOrdersCollection(db);
+
+    await refreshQueuePositions(db);
 
     const orders = await queueCollection
-      .find({}) // latest orders first
+      .find({})
+      .sort({ created_at: -1, placedAt: -1 })
       .toArray();
 
+    const normalizedOrders = orders.map((order) => ({
+      ...order,
+      status: normalizeOrderStatus(order.status)
+    }));
 
     res.status(200).json({
       message: 'All queue orders fetched successfully',
-      data: orders
+      data: normalizedOrders
     });
   } catch (error) {
     console.error('Error fetching queue orders:', error);
@@ -1788,17 +2126,63 @@ app.get('/queue', async (req, res) => {
   }
 });
 
+app.get('/queue/stream', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    if (typeof res.flushHeaders === 'function') {
+      res.flushHeaders();
+    }
+
+    queueStreamClients.add(res);
+
+    const [activeQueue, completedOrders, stats] = await Promise.all([
+      getActiveQueueSnapshot(db),
+      getCompletedOrdersSnapshot(db),
+      getQueueStatsSnapshot(db)
+    ]);
+
+    const initialPayload = JSON.stringify({
+      activeQueue,
+      completedOrders: completedOrders.map((order) => ({
+        ...order,
+        status: ORDER_STATUS.COMPLETED
+      })),
+      stats,
+      updatedAt: new Date().toISOString()
+    });
+
+    res.write('event: queue_update\n');
+    res.write(`data: ${initialPayload}\n\n`);
+
+    const keepAlive = setInterval(() => {
+      res.write('event: ping\n');
+      res.write('data: {}\n\n');
+    }, 25000);
+
+    req.on('close', () => {
+      clearInterval(keepAlive);
+      queueStreamClients.delete(res);
+      res.end();
+    });
+  } catch (error) {
+    console.error('Queue stream error:', error);
+    res.status(500).json({ message: 'Failed to start queue stream' });
+  }
+});
+
 app.get('/latqueue', async (req, res) => {
   try {
     const client = await connectToDatabase();
     const db = client.db('CentralCafetaria');
-    const queueCollection = db.collection('OrdersQueue');
 
-    const orders = await queueCollection
-      .find({
-        status: { $nin: ['served', 'cancelled'] } // Exclude served & cancelled
-      }) // latest orders first (corrected field name)
-      .toArray();
+    const orders = await getActiveQueueSnapshot(db);
 
     res.status(200).json({
       message: 'Active queue orders fetched successfully',
@@ -1813,6 +2197,135 @@ app.get('/latqueue', async (req, res) => {
   }
 });
 
+app.get('/queue/completed', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+
+    const completedOrders = await getCompletedOrdersSnapshot(db, 500);
+
+    res.status(200).json({
+      message: 'Completed orders fetched successfully',
+      data: completedOrders.map((order) => ({
+        ...order,
+        status: ORDER_STATUS.COMPLETED
+      }))
+    });
+  } catch (error) {
+    console.error('Error fetching completed orders:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.get('/queue/token/:token', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+    const queueCollection = getQueueOrdersCollection(db);
+    const { token } = req.params;
+    const queueControl = await ensureQueueControl(db);
+    const minutesPerOrder = queueControl.minutesPerOrder || 2;
+
+    await refreshQueuePositions(db);
+
+    const order = await queueCollection.findOne({ token });
+
+    if (!order) {
+      return res.status(404).json({ message: 'No order found for this token.' });
+    }
+
+    const normalizedStatus = normalizeOrderStatus(order.status);
+    const queuePosition = Number(order.queue_position) > 0 ? Number(order.queue_position) : 1;
+    res.status(200).json({
+      message: 'Order fetched successfully',
+      data: {
+        ...order,
+        status: normalizedStatus,
+        estimated_waiting_minutes: normalizedStatus === ORDER_STATUS.COMPLETED
+          ? 0
+          : (Number(order.estimated_waiting_minutes) > 0
+            ? Number(order.estimated_waiting_minutes)
+            : calculateEstimatedWaitingMinutes(queuePosition, minutesPerOrder))
+      }
+    });
+  } catch (error) {
+    console.error('Error searching by token:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.get('/queue-control', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+    const control = await ensureQueueControl(db);
+
+    res.status(200).json(control);
+  } catch (error) {
+    console.error('Error fetching queue control:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.patch('/queue-control', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+
+    const { minutesPerOrder, queueEnabled } = req.body;
+    const updates = { updatedAt: new Date() };
+
+    if (minutesPerOrder !== undefined) {
+      const parsed = Number(minutesPerOrder);
+      if (!Number.isFinite(parsed) || parsed < 1) {
+        return res.status(400).json({ message: 'minutesPerOrder must be a number >= 1' });
+      }
+      updates.minutesPerOrder = parsed;
+    }
+
+    if (queueEnabled !== undefined) {
+      updates.queueEnabled = Boolean(queueEnabled);
+    }
+
+    await db.collection(QUEUE_CONTROL_COLLECTION).updateOne(
+      { _id: QUEUE_CONTROL_DOC_ID },
+      {
+        $setOnInsert: {
+          ...DEFAULT_QUEUE_CONTROL,
+          createdAt: new Date()
+        },
+        $set: updates
+      },
+      { upsert: true }
+    );
+
+    const control = await ensureQueueControl(db);
+
+    await refreshQueuePositions(db);
+    await broadcastQueueUpdate(db);
+
+    res.status(200).json({ message: 'Queue control updated', control });
+  } catch (error) {
+    console.error('Error updating queue control:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.get('/queue/stats', async (req, res) => {
+  try {
+    const client = await connectToDatabase();
+    const db = client.db('CentralCafetaria');
+
+    await refreshQueuePositions(db);
+    const stats = await getQueueStatsSnapshot(db);
+
+    res.status(200).json(stats);
+  } catch (error) {
+    console.error('Error fetching queue stats:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 // ===== Enhanced Sales Report Endpoints =====
 
 // Get available months with sales data
@@ -1820,11 +2333,11 @@ app.get('/api/sales/months', async (req, res) => {
   try {
     const client = await connectToDatabase();
     const db = client.db('CentralCafetaria');
-    const ordersCollection = db.collection('OrdersQueue');
+    const ordersCollection = getQueueOrdersCollection(db);
     const eventsCollection = db.collection('Events');
 
     const salesMonthsPromise = ordersCollection.aggregate([
-      { $match: { status: 'served' } },
+      { $match: { status: ORDER_STATUS.COMPLETED } },
       {
         $group: {
           _id: {
@@ -2012,10 +2525,10 @@ app.get('/api/sales/download', async (req, res) => {
 
     const client = await connectToDatabase();
     const db = client.db('CentralCafetaria');
-    const ordersCollection = db.collection('OrdersQueue');
+    const ordersCollection = getQueueOrdersCollection(db);
 
     const query = {
-      status: 'served',
+      status: ORDER_STATUS.COMPLETED,
       placedAt: { $gte: start, $lt: end }
     };
 
@@ -2035,10 +2548,10 @@ app.get('/api/sales/download', async (req, res) => {
 const getSalesReport = async (startDate, endDate, page, limit) => {
   const client = await connectToDatabase();
   const db = client.db('CentralCafetaria');
-  const ordersCollection = db.collection('OrdersQueue');
+  const ordersCollection = getQueueOrdersCollection(db);
 
   const query = {
-    status: 'served',
+    status: ORDER_STATUS.COMPLETED,
     placedAt: { $gte: startDate, $lt: endDate }
   };
 
@@ -2067,7 +2580,7 @@ app.get('/api/sales/overall-analytics', async (req, res) => {
   try {
     const client = await connectToDatabase();
     const db = client.db('CentralCafetaria');
-    const ordersCollection = db.collection('OrdersQueue');
+    const ordersCollection = getQueueOrdersCollection(db);
 
     const { year, month } = req.query;
     let startDate, endDate;
@@ -2082,7 +2595,7 @@ app.get('/api/sales/overall-analytics', async (req, res) => {
     }
 
     const query = {
-      status: 'served',
+      status: ORDER_STATUS.COMPLETED,
       placedAt: { $gte: startDate, $lt: endDate }
     };
 
@@ -2108,10 +2621,10 @@ app.get('/api/sales/overall-analytics', async (req, res) => {
 const getSalesAnalytics = async (startDate, endDate) => {
   const client = await connectToDatabase();
   const db = client.db('CentralCafetaria');
-  const ordersCollection = db.collection('OrdersQueue');
+  const ordersCollection = getQueueOrdersCollection(db);
 
   const query = {
-    status: 'served',
+    status: ORDER_STATUS.COMPLETED,
     placedAt: { $gte: startDate, $lt: endDate }
   };
 
