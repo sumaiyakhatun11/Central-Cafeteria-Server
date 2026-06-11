@@ -230,7 +230,7 @@ app.post('/register', async (req, res) => {
     }
 
     const normalizedRole = typeof role === 'string' ? role.toLowerCase().trim() : 'teacher';
-    const allowedRoles = ['student', 'teacher'];
+    const allowedRoles = ['student', 'teacher', 'staff'];
     if (!allowedRoles.includes(normalizedRole)) {
       return res.status(400).json({ message: 'Invalid role selected' });
     }
@@ -427,7 +427,7 @@ app.get('/users', async (req, res) => {
 
     // Pagination parameters
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
+    const limit = parseInt(req.query.limit) || 1000;
     const skip = (page - 1) * limit;
 
     // Basic filtering
@@ -439,9 +439,10 @@ app.get('/users', async (req, res) => {
       filter.email = { $regex: req.query.email, $options: 'i' };
     }
 
-    // Get users with pagination
+    // Get users with pagination, newest first
     const users = await db.collection('Users')
       .find(filter, { projection: { password: 0 } })
+      .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
       .toArray();
@@ -1881,7 +1882,7 @@ app.post('/order/queue', async (req, res) => {
   try {
     const client = await connectToDatabase();
     const db = client.db('CentralCafetaria');
-      const { userId, usePrivilege = false, payWithCoins = false, tableNumber = null } = req.body;
+      const { userId, usePrivilege = false, payWithCoins = false, tableNumber = null, counter: selectedCounter = null } = req.body;
 
     if (!userId) {
       return res.status(400).json({ message: 'User ID is required' });
@@ -1915,6 +1916,15 @@ app.post('/order/queue', async (req, res) => {
     // If user is not actually privileged but tries to use it
     if (usePrivilege && !user.privileged) {
       return res.status(403).json({ message: 'Unauthorized privilege usage attempt' });
+    }
+
+    if (user && (user.role === 'student' || user.role === 'staff')) {
+      if (!selectedCounter) {
+        return res.status(400).json({ message: 'Counter selection is required for students and staff.' });
+      }
+      if (!['1', '2'].includes(String(selectedCounter))) {
+        return res.status(400).json({ message: 'Invalid counter selection.' });
+      }
     }
 
     // Generate queue ID + token
@@ -1956,6 +1966,7 @@ app.post('/order/queue', async (req, res) => {
       completed_at: null,
       totalPrice,
       tableNumber: tableNumber || null,
+      counter: selectedCounter || null,
       ...(usePrivilege && { privilegeUsed: true }),
       ...(payWithCoins && { paidWithCoins: true })
     };
@@ -2111,8 +2122,8 @@ app.patch('/order/:id/received', async (req, res) => {
     }
 
     const currentStatus = normalizeOrderStatus(order.status);
-    if (currentStatus !== ORDER_STATUS.READY) {
-      return res.status(400).json({ message: 'Order must be Ready before marking as received.' });
+    if (![ORDER_STATUS.PLACED, ORDER_STATUS.READY].includes(currentStatus)) {
+      return res.status(400).json({ message: 'Only placed or ready orders can be marked as completed.' });
     }
 
     await queueCollection.updateOne(
