@@ -139,7 +139,7 @@ app.post('/login', async (req, res) => {
     }
 
     // Destructure and prepare response data
-    const { _id, email, id, role, name, privileged, isadmin, isSuperAdmin } = user;
+    const { _id, email, id, role, name, privileged, isadmin, isSuperAdmin, phone, registrationNumber, profilePicture, coins, verified, createdAt } = user;
     const resolvedRole = role || (isadmin || isSuperAdmin ? 'admin' : 'user');
 
     res.status(200).json({
@@ -150,7 +150,13 @@ app.post('/login', async (req, res) => {
         email,
         userId: id,
         role: resolvedRole,
-        privileged: privileged || false
+        privileged: privileged || false,
+        phone: phone || '',
+        registrationNumber: registrationNumber || '',
+        profilePicture: profilePicture || '',
+        coins: coins || 0,
+        verified: verified || false,
+        createdAt: createdAt || new Date()
       }
     });
 
@@ -184,7 +190,7 @@ app.post('/login-qr', async (req, res) => {
     }
 
     // If user is found and verified, log them in without a password
-    const { _id, email, role, name, privileged, id } = user;
+    const { _id, email, role, name, privileged, id, phone, registrationNumber, profilePicture, coins, verified, createdAt } = user;
 
     res.status(200).json({
       message: 'Login successful',
@@ -194,7 +200,13 @@ app.post('/login-qr', async (req, res) => {
         email,
         userId: id,
         role: role || 'user',
-        privileged: privileged || false
+        privileged: privileged || false,
+        phone: phone || '',
+        registrationNumber: registrationNumber || '',
+        profilePicture: profilePicture || '',
+        coins: coins || 0,
+        verified: verified || false,
+        createdAt: createdAt || new Date()
       }
     });
 
@@ -623,7 +635,7 @@ app.patch('/users/:id', async (req, res) => {
     const client = await connectToDatabase();
     const db = client.db('CentralCafetaria');
     const { id } = req.params;
-    const { name, email, address, profilePicture } = req.body;
+    const { name, email, address, profilePicture, phone } = req.body;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ message: 'Invalid ID format' });
@@ -634,39 +646,7 @@ app.patch('/users/:id', async (req, res) => {
     if (email) updateFields.email = email;
     if (address) updateFields.address = address;
     if (profilePicture) updateFields.profilePicture = profilePicture;
-
-    const result = await db.collection('Users').updateOne(
-      { _id: new ObjectId(id) },
-      { $set: updateFields }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    res.status(200).json({ message: 'User updated successfully' });
-  } catch (error) {
-    console.error('Error updating user:', error);
-    res.status(500).json({ message: 'Internal server error' });
-  }
-});
-
-app.patch('/users/:id', async (req, res) => {
-  try {
-    const client = await connectToDatabase();
-    const db = client.db('CentralCafetaria');
-    const { id } = req.params;
-    const { name, email, address, profilePicture } = req.body;
-
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ message: 'Invalid ID format' });
-    }
-
-    const updateFields = {};
-    if (name) updateFields.name = name;
-    if (email) updateFields.email = email;
-    if (address) updateFields.address = address;
-    if (profilePicture) updateFields.profilePicture = profilePicture;
+    if (phone) updateFields.phone = phone;
 
     const result = await db.collection('Users').updateOne(
       { _id: new ObjectId(id) },
